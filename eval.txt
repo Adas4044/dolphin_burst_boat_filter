@@ -1,0 +1,16 @@
+Train:
+
+21 examples of boat noise, 52 examples of clicks, bursts
+
+
+
+When ran on new, never before seen dataset of 57 labels:
+
+10 of which being boat, 47 of which being bursts
+
+Identified 47/47 as dolphin
+Identified 9/10 as boat
+
+98.2% accuracy
+
+
