@@ -1,3 +1,10 @@
 # Test data and training data (too large for GitHub)
-test/
-training_data/
+boat_noise_filter/test/
+boat_noise_filter/training_data/
+dolphin_burst_whistle_filter/test/
+dolphin_burst_whistle_filter/training_data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,5 @@
+# Test files for burst vs whistle classification
+# Format: wav_file_path    label_file_path
+
+test/ChatJr1_2025-09-01_20h22m46.655s.wav	test/ChatJr1_2025-09-01_20h22m46.655s.txt
+test/dolphin2-2015-06-22T163845-192k.wav	test/dolphin2-2015-06-22T163845-192k.txt
