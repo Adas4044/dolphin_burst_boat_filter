@@ -8,6 +8,7 @@ import numpy as np
 import librosa
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
+from scipy.signal import find_peaks
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -35,7 +36,43 @@ def extract_features(audio_segment, sr):
     high = np.sum(np.abs(fft[(freqs >= 5000) & (freqs < 20000)])**2) / total_energy
     very_high = np.sum(np.abs(fft[freqs >= 20000])**2) / total_energy
 
-    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high])
+    # Calculate click rate: count energy peaks per second
+    # Use RMS envelope with frame length of 512 samples (~2.7ms at 192kHz)
+    hop_length = 256
+    rms_envelope = librosa.feature.rms(y=audio_segment, frame_length=512, hop_length=hop_length)[0]
+
+    # Detect peaks in the RMS envelope
+    # Use threshold of 30% of max amplitude to filter out noise
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        threshold = 0.3 * np.max(rms_envelope)
+        peaks, _ = find_peaks(rms_envelope, height=threshold, distance=int(sr / hop_length * 0.01))  # Min 10ms between peaks
+        duration = len(audio_segment) / sr
+        click_rate = len(peaks) / duration if duration > 0 else 0
+    else:
+        click_rate = 0
+
+    # Calculate envelope attack time: time from onset to peak amplitude
+    # Bursts have sharp attacks (1-5ms), whistles have gradual onsets (20-100ms)
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        # Find the peak amplitude
+        peak_idx = np.argmax(rms_envelope)
+        peak_amplitude = rms_envelope[peak_idx]
+
+        # Find onset: first point that crosses 10% of peak amplitude
+        onset_threshold = 0.1 * peak_amplitude
+        onset_idx = 0
+        for i in range(peak_idx + 1):
+            if rms_envelope[i] >= onset_threshold:
+                onset_idx = i
+                break
+
+        # Calculate attack time in milliseconds
+        attack_time_samples = (peak_idx - onset_idx) * hop_length
+        attack_time_ms = (attack_time_samples / sr) * 1000
+    else:
+        attack_time_ms = 0
+
+    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high, click_rate, attack_time_ms])
 
 def parse_labels(label_path):
     """Parse Audacity/Raven-style label file."""
@@ -67,6 +104,29 @@ def load_segment(audio_path, start, end, sr):
     y, _ = librosa.load(audio_path, sr=sr, offset=start, duration=duration, mono=True)
     return y
 
+def remove_overlapping_segments(labels):
+    """Remove segments that overlap with each other, keeping only non-overlapping ones."""
+    if len(labels) == 0:
+        return []
+
+    # Sort segments by start time
+    sorted_labels = sorted(labels, key=lambda x: x[0])
+
+    clean_segments = []
+    for start, end, label in sorted_labels:
+        # Check if this segment overlaps with any previously accepted segment
+        has_overlap = False
+        for prev_start, prev_end, _ in clean_segments:
+            # Check for overlap: segments overlap if one starts before the other ends
+            if not (end <= prev_start or start >= prev_end):
+                has_overlap = True
+                break
+
+        if not has_overlap:
+            clean_segments.append((start, end, label))
+
+    return clean_segments
+
 def train_classifier():
     """Train burst vs whistle classifier on labeled training data."""
     print("Training burst vs whistle classifier...")
@@ -81,6 +141,10 @@ def train_classifier():
         ("short_wav", "short_wav/short.wav", "short_wav/Labels2.txt", None),
         ("dolphin2-2014", "dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.wav",
          "dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.txt", None),
+        ("dolphin2-2015-135557", "dolphin2-2015-06-17T135557-192k/dolphin2-2015-06-17T135557-192k.wav",
+         "dolphin2-2015-06-17T135557-192k/dolphin2-2015-06-17T135557-192k.txt", None),
+        ("dolphin1-2014", "../test/dolphin1-2014-06-29T144243.wav",
+         "../test/dolphin1-2014-06-29T144243.txt", None),
     ]
 
     X_burst = []
@@ -95,6 +159,9 @@ def train_classifier():
             continue
 
         labels = parse_labels(label_path)
+
+        # Remove overlapping segments to prevent training contamination
+        labels = remove_overlapping_segments(labels)
 
         if sample_limit is not None:
             burst_segments = [(s, e) for s, e, l in labels if l == 'b']
@@ -161,9 +228,17 @@ def test_on_file(classifier, audio_path, label_path):
     labels = parse_labels(label_path)
 
     # Get only burst and whistle labels for testing
-    test_labels = [(s, e, l) for s, e, l in labels if l in ['b', 'w']]
+    test_labels_raw = [(s, e, l) for s, e, l in labels if l in ['b', 'w']]
 
-    print(f"Total segments to test: {len(test_labels)}")
+    # Remove overlapping segments
+    test_labels = remove_overlapping_segments(test_labels_raw)
+
+    removed_count = len(test_labels_raw) - len(test_labels)
+
+    print(f"Raw segments: {len(test_labels_raw)}")
+    print(f"Clean segments (non-overlapping): {len(test_labels)}")
+    if removed_count > 0:
+        print(f"Removed {removed_count} overlapping segments")
     print(f"  Bursts (b) ground truth: {sum(1 for _, _, l in test_labels if l == 'b')}")
     print(f"  Whistles (w) ground truth: {sum(1 for _, _, l in test_labels if l == 'w')}")
 
@@ -220,9 +295,7 @@ def test_on_file(classifier, audio_path, label_path):
             })
 
     # Summary
-    print(f"\n{'='*80}")
-    print("RESULTS SUMMARY")
-    print(f"{'='*80}")
+    print("Summary of Results")
 
     if results['burst_total'] > 0:
         acc = results['burst_correct'] / results['burst_total'] * 100
@@ -252,6 +325,8 @@ def main():
     ]
 
     all_results = []
+    all_predictions = []
+
     for wav_file, label_file in test_files:
         wav_path = Path(wav_file)
         label_path = Path(label_file)
@@ -259,13 +334,18 @@ def main():
         if wav_path.exists() and label_path.exists():
             results = test_on_file(classifier, wav_path, label_path)
             all_results.append((wav_path.name, results))
+
+            # Collect predictions with file info for hardest cases analysis
+            for pred in results['predictions']:
+                pred['file'] = wav_path.name
+                all_predictions.append(pred)
         else:
             print(f"\nWarning: Test file not found: {wav_path.name}")
 
     # Final summary
     if len(all_results) > 0:
         print(f"\n{'='*80}")
-        print("FINAL SUMMARY - ALL TEST FILES")
+        print("FINAL SUMMARY")
         print(f"{'='*80}")
 
         total_burst = sum(r['burst_total'] for _, r in all_results)
@@ -281,6 +361,36 @@ def main():
 
         print(f"\nOVERALL: {correct_burst + correct_whistle}/{total_burst + total_whistle} "
               f"({(correct_burst + correct_whistle)/(total_burst + total_whistle)*100 if total_burst + total_whistle > 0 else 0:.1f}%)")
+
+    # Generate 50 hardest to differentiate cases
+    if len(all_predictions) > 0:
+        print(f"\n{'='*80}")
+        print("50 HARDEST TO DIFFERENTIATE CASES")
+        print(f"{'='*80}")
+
+        # Calculate uncertainty metric (closeness to 50/50)
+        for pred in all_predictions:
+            pred['uncertainty'] = abs(pred['burst_confidence'] - 0.5)
+
+        # Sort by uncertainty (lowest = most uncertain/hardest to differentiate)
+        hardest = sorted(all_predictions, key=lambda x: x['uncertainty'])[:50]
+
+        print(f"{'File':<40} {'Time':<20} {'True':<8} {'Pred':<8} {'Burst%':<10} {'Whistle%':<10} {'Correct':<8}")
+        print("-" * 110)
+
+        for pred in hardest:
+            status = 'YES' if pred['correct'] else 'NO'
+            print(f"{pred['file']:<40} {pred['start']:>7.2f}s-{pred['end']:<8.2f}s  "
+                  f"{pred['true_label']:<8} {pred['predicted']:<8} "
+                  f"{pred['burst_confidence']:<9.1%} {pred['whistle_confidence']:<9.1%} {status:<8}")
+
+        # Stats on hardest cases
+        correct_count = sum(1 for p in hardest if p['correct'])
+        incorrect_count = len(hardest) - correct_count
+
+        print(f"\nStats on 50 hardest cases:")
+        print(f"  Correct: {correct_count} ({correct_count/len(hardest)*100:.1f}%)")
+        print(f"  Incorrect: {incorrect_count} ({incorrect_count/len(hardest)*100:.1f}%)")
 
 if __name__ == "__main__":
     main()

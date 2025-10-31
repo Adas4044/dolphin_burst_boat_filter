@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
+from scipy.signal import find_peaks
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -12,7 +13,6 @@ SAMPLE_RATE = 192000
 TRAINING_DATA_PATH = Path(__file__).parent / "training_data"
 
 def extract_features(audio_segment, sr):
-    """Extract spectral features from audio segment."""
     if len(audio_segment) < 512:
         return None
 
@@ -32,7 +32,34 @@ def extract_features(audio_segment, sr):
     high = np.sum(np.abs(fft[(freqs >= 5000) & (freqs < 20000)])**2) / total_energy
     very_high = np.sum(np.abs(fft[freqs >= 20000])**2) / total_energy
 
-    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high])
+    # Calculate click rate: count energy peaks per second
+    hop_length = 256
+    rms_envelope = librosa.feature.rms(y=audio_segment, frame_length=512, hop_length=hop_length)[0]
+
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        threshold = 0.3 * np.max(rms_envelope)
+        peaks, _ = find_peaks(rms_envelope, height=threshold, distance=int(sr / hop_length * 0.01))
+        duration = len(audio_segment) / sr
+        click_rate = len(peaks) / duration if duration > 0 else 0
+    else:
+        click_rate = 0
+
+    # Calculate envelope attack time
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        peak_idx = np.argmax(rms_envelope)
+        peak_amplitude = rms_envelope[peak_idx]
+        onset_threshold = 0.1 * peak_amplitude
+        onset_idx = 0
+        for i in range(peak_idx + 1):
+            if rms_envelope[i] >= onset_threshold:
+                onset_idx = i
+                break
+        attack_time_samples = (peak_idx - onset_idx) * hop_length
+        attack_time_ms = (attack_time_samples / sr) * 1000
+    else:
+        attack_time_ms = 0
+
+    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high, click_rate, attack_time_ms])
 
 def parse_labels(label_path):
     """Parse Audacity/Raven-style label file."""
@@ -153,7 +180,7 @@ def main():
 
     # Define all files to analyze (both training and test)
     all_files = [
-        # TRAINING DATA
+        # TRAINING
         ("training_data/Mike Labels/dolphin3-2014-07-26T212435-192k.wav",
          "training_data/Mike Labels/Labels.txt", "TRAIN"),
         ("training_data/ChatJr1/ChatJr1_2025-09-04_17h28m24.192s.wav",
@@ -164,7 +191,7 @@ def main():
          "training_data/short_wav/Labels2.txt", "TRAIN"),
         ("training_data/dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.wav",
          "training_data/dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.txt", "TRAIN"),
-        # TEST DATA
+        # TEST
         ("test/ChatJr1_2025-09-01_20h22m46.655s.wav",
          "test/ChatJr1_2025-09-01_20h22m46.655s.txt", "TEST"),
         ("test/dolphin2-2015-06-22T163845-192k.wav",
@@ -215,9 +242,7 @@ def main():
     # Sort by uncertainty (most uncertain = closest to 50%)
     all_segments.sort(key=lambda x: x['uncertainty'])
 
-    print("=" * 130)
-    print("TOP 50 MOST DIFFICULT TO CLASSIFY SEGMENTS - TRAINING + TEST DATA (BURST vs WHISTLE)")
-    print("=" * 130)
+    print("50 MOST DIFFICULT TO CLASSIFY SEGMENTS:")
     print(f"{'Dataset':<7} {'File':<50} {'Time':<20} {'True':<6} {'Burst Conf':<12} {'Whistle Conf':<13} {'Correct':<8}")
     print("-" * 130)
 
@@ -226,9 +251,8 @@ def main():
         print(f"{seg['dataset']:<7} {seg['file']:<50} {seg['start']:>7.2f}s-{seg['end']:<8.2f}s  "
               f"{seg['true_label']:<6} {seg['burst_conf']:<11.0%} {seg['whistle_conf']:<12.0%} {status:<8}")
 
-    print("\n" + "=" * 130)
-    print("STATISTICS")
-    print("=" * 130)
+    print("\n")
+    print("Stats")
     train_segs = [s for s in all_segments if s['dataset'] == 'TRAIN']
     test_segs = [s for s in all_segments if s['dataset'] == 'TEST']
 

@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
+from scipy.signal import find_peaks
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -13,7 +14,6 @@ SAMPLE_RATE = 192000
 TRAINING_DATA_PATH = Path(__file__).parent / "training_data"
 
 def extract_features(audio_segment, sr):
-    """Extract spectral features from audio segment."""
     if len(audio_segment) < 512:
         return None
 
@@ -33,10 +33,41 @@ def extract_features(audio_segment, sr):
     high = np.sum(np.abs(fft[(freqs >= 5000) & (freqs < 20000)])**2) / total_energy
     very_high = np.sum(np.abs(fft[freqs >= 20000])**2) / total_energy
 
-    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high])
+    hop_length = 256
+    rms_envelope = librosa.feature.rms(y=audio_segment, frame_length=512, hop_length=hop_length)[0]
+
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        threshold = 0.3 * np.max(rms_envelope)
+        peaks, _ = find_peaks(rms_envelope, height=threshold, distance=int(sr / hop_length * 0.01))  # Min 10ms between peaks
+        duration = len(audio_segment) / sr
+        click_rate = len(peaks) / duration if duration > 0 else 0
+    else:
+        click_rate = 0
+
+    # Calculate envelope attack time: time from onset to peak amplitude
+    # Bursts have sharp attacks (1-5ms), whistles have gradual onsets (20-100ms)
+    if len(rms_envelope) > 0 and np.max(rms_envelope) > 0:
+        # Find the peak amplitude
+        peak_idx = np.argmax(rms_envelope)
+        peak_amplitude = rms_envelope[peak_idx]
+
+        # Find onset: first point that crosses 10% of peak amplitude
+        onset_threshold = 0.1 * peak_amplitude
+        onset_idx = 0
+        for i in range(peak_idx + 1):
+            if rms_envelope[i] >= onset_threshold:
+                onset_idx = i
+                break
+
+        # Calculate attack time in milliseconds
+        attack_time_samples = (peak_idx - onset_idx) * hop_length
+        attack_time_ms = (attack_time_samples / sr) * 1000
+    else:
+        attack_time_ms = 0
+
+    return np.array([centroid, rolloff, zcr, rms, bandwidth, very_low, low, mid, high, very_high, click_rate, attack_time_ms])
 
 def parse_labels(label_path):
-    """Parse Audacity/Raven-style label file."""
     labels = []
     with open(label_path, 'r') as f:
         for line in f:
@@ -47,8 +78,8 @@ def parse_labels(label_path):
             parts = line.split('\t')
             if len(parts) >= 3:
                 try:
-                    if '→' in parts[0]:
-                        parts[0] = parts[0].split('→')[1]
+                    if '->' in parts[0]:
+                        parts[0] = parts[0].split('->')[1]
 
                     start = float(parts[0])
                     end = float(parts[1])
@@ -60,20 +91,40 @@ def parse_labels(label_path):
     return labels
 
 def load_segment(audio_path, start, end, sr):
-    """Load a specific segment of audio."""
     duration = end - start
     y, _ = librosa.load(audio_path, sr=sr, offset=start, duration=duration, mono=True)
     return y
 
+def remove_overlapping_segments(labels):
+    """Remove segments that overlap with each other, keeping only non-overlapping ones."""
+    if len(labels) == 0:
+        return []
+
+    # Sort segments by start time
+    sorted_labels = sorted(labels, key=lambda x: x[0])
+
+    clean_segments = []
+    for start, end, label in sorted_labels:
+        # Check if this segment overlaps with any previously accepted segment
+        has_overlap = False
+        for prev_start, prev_end, _ in clean_segments:
+            # Check for overlap: segments overlap if one starts before the other ends
+            if not (end <= prev_start or start >= prev_end):
+                has_overlap = True
+                break
+
+        if not has_overlap:
+            clean_segments.append((start, end, label))
+
+    return clean_segments
 
 def train_classifier():
     """Train burst vs whistle classifier on labeled training data."""
     print("Training burst vs whistle classifier...")
 
-    # Training data sources with both burst (b) and whistle (w) labels
     training_sources = [
         ("Mike Labels", "Mike Labels/dolphin3-2014-07-26T212435-192k.wav",
-         "Mike Labels/Labels.txt", 50),  # Limit Mike's data: 35 bursts, 192 whistles
+         "Mike Labels/Labels.txt", 50),  # Mike's data: 35 bursts, 192 whistles
         ("ChatJr1", "ChatJr1/ChatJr1_2025-09-04_17h28m24.192s.wav",
          "ChatJr1/Labels1.txt", None),  # 6 bursts, 22 whistles
         ("dolphin2-2015", "dolphin2-2015-06-17T152927-192k/dolphin2-2015-06-17T152927-192k.wav",
@@ -81,6 +132,10 @@ def train_classifier():
         ("short_wav", "short_wav/short.wav", "short_wav/Labels2.txt", None),  # 1 burst, 4 whistles
         ("dolphin2-2014", "dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.wav",
          "dolphin2-2014-08-07T123208-192k/dolphin2-2014-08-07T123208-192k.txt", None),  # 16 bursts, 14 whistles
+        ("dolphin2-2015-135557", "dolphin2-2015-06-17T135557-192k/dolphin2-2015-06-17T135557-192k.wav",
+         "dolphin2-2015-06-17T135557-192k/dolphin2-2015-06-17T135557-192k.txt", None),
+        ("dolphin1-2014", "test/dolphin1-2014-06-29T144243.wav",
+         "test/dolphin1-2014-06-29T144243.txt", None),
     ]
 
     X_burst = []
@@ -96,8 +151,11 @@ def train_classifier():
 
         labels = parse_labels(label_path)
 
+        # Remove overlapping segments to prevent training contamination
+        labels = remove_overlapping_segments(labels)
+
         if sample_limit is not None:
-            # Sample evenly from bursts and whistles
+            #sample evenly from b and w
             burst_segments = [(s, e) for s, e, l in labels if l == 'b']
             whistle_segments = [(s, e) for s, e, l in labels if l == 'w']
 
@@ -112,7 +170,6 @@ def train_classifier():
                     if features is not None:
                         X_burst.append(features)
 
-            # Sample whistles
             if len(whistle_segments) > 0:
                 n_whistle_samples = min(sample_limit // 2, len(whistle_segments))
                 sample_indices = np.linspace(0, len(whistle_segments)-1, n_whistle_samples, dtype=int)
@@ -123,7 +180,6 @@ def train_classifier():
                     if features is not None:
                         X_whistle.append(features)
         else:
-            # Use all segments
             for start, end, label in labels:
                 if label not in ['b', 'w']:
                     continue
@@ -137,7 +193,7 @@ def train_classifier():
                     elif label == 'w':
                         X_whistle.append(features)
 
-    # Train classifier: 1 = burst, 0 = whistle
+    #Train: 1 = burst, 0 = whistle
     X_burst = np.array(X_burst)
     X_whistle = np.array(X_whistle)
     X = np.vstack([X_burst, X_whistle])
@@ -156,10 +212,6 @@ def train_classifier():
 
     return classifier
 
-
-# ============================================================================
-# DETECTION
-# ============================================================================
 
 def classify_dolphin_sounds(classifier, audio_path, label_path):
     """Classify dolphin sounds as bursts or whistles."""
@@ -211,14 +263,10 @@ def main():
         print(f"Error: Input file '{input_file}' not found!")
         sys.exit(1)
 
-    print("=" * 80)
     print("Dolphin Burst vs Whistle Classifier")
-    print("=" * 80)
 
-    # Train classifier
     classifier = train_classifier()
 
-    # Read input file
     print(f"\nReading input file: {input_file}")
     file_pairs = []
 
@@ -242,13 +290,10 @@ def main():
 
     print(f"  Found {len(file_pairs)} file pairs")
 
-    print("\n" + "=" * 80)
     print("CLASSIFYING DOLPHIN SOUNDS")
-    print("=" * 80)
 
     for wav_path, label_path in file_pairs:
         print(f"\n{wav_path.name}")
-        print("-" * 80)
 
         if not wav_path.exists():
             print(f"  Error: WAV file not found!")
@@ -278,7 +323,6 @@ def main():
                       f"whistle: {cls['whistle_confidence']:.1%}) "
                       f"[original label: {cls['original_label']}]")
 
-            # Save results
             output_path = wav_path.parent / f"{wav_path.stem}_BURST_WHISTLE_CLASSIFICATION.txt"
             with open(output_path, 'w') as f:
                 f.write("# Dolphin sound classification: BURST vs WHISTLE\n")
@@ -290,9 +334,7 @@ def main():
 
             print(f"\n  → Saved to: {output_path.name}")
 
-    print("\n" + "=" * 80)
-    print("DONE!")
-    print("=" * 80)
+    print("Done!")
 
 
 if __name__ == "__main__":
